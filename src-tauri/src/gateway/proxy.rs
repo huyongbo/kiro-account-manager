@@ -3275,7 +3275,7 @@ fn stream_proxy_response(
                                                         "content_block": {
                                                             "type": "tool_use",
                                                             "id": id,
-                                                            "name": name,
+                                                            "name": original_name,
                                                             "input": {}
                                                         }
                                                     });
@@ -3300,7 +3300,7 @@ fn stream_proxy_response(
                                                             "type": "function_call",
                                                             "status": "in_progress",
                                                             "call_id": id,
-                                                            "name": name,
+                                                            "name": original_name,
                                                             "arguments": ""
                                                         }
                                                     });
@@ -3325,7 +3325,7 @@ fn stream_proxy_response(
                                                                     id: id.clone(),
                                                                     call_type: "function".to_string(),
                                                                     function: crate::gateway::models::OpenAIToolCallFunction {
-                                                                        name: name.clone(),
+                                                                        name: original_name.clone(),
                                                                         arguments: "".to_string(),
                                                                     },
                                                                 }

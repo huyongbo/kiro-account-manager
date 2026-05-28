@@ -733,6 +733,18 @@ pub async fn add_local_kiro_account(
         let region = local_token
             .region
             .clone()
+            .or_else(|| {
+                // kiro-auth-token.json 里没有 region 时，尝试从 kiro-auth-token-cli.json 读取
+                let home = std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .ok()?;
+                let path = std::path::Path::new(&home)
+                    .join(".aws").join("sso").join("cache")
+                    .join("kiro-auth-token-cli.json");
+                let content = std::fs::read_to_string(&path).ok()?;
+                let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+                v["region"].as_str().map(str::to_string)
+            })
             .unwrap_or_else(|| "us-east-1".to_string());
 
         let client_reg = get_client_registration(&hash)
@@ -839,6 +851,9 @@ async fn add_account_by_idc_internal(
     };
 
     // BuilderId 和 Enterprise 都使用默认 region（如果未提供）
+    // oidc_region：IdC client 注册的 region，用于 token 刷新（来自 kiro-auth-token.json）
+    // region：CW 服务调用的 region，由多区域探测决定
+    let oidc_region = params.region.clone();
     let mut region = params.region.unwrap_or_else(|| "us-east-1".to_string());
 
     // 获取 machine_id（企业账号多区域探测需要）
@@ -870,8 +885,8 @@ async fn add_account_by_idc_internal(
 
         // 企业账号使用多区域探测
         let usage_result = if is_enterprise {
-            let (result, detected_region) = get_enterprise_usage_with_region_probe(&auth_result.access_token, &machine_id).await?;
-            region = detected_region;
+            let (result, detected_cw_region) = get_enterprise_usage_with_region_probe(&auth_result.access_token, &machine_id).await?;
+            region = detected_cw_region; // CW 服务 region，与 oidc_region 分开
             result
         } else {
             get_usage_by_provider(&params.provider_id, &auth_result.access_token).await?
@@ -943,8 +958,8 @@ async fn add_account_by_idc_internal(
 
         // 企业账号使用多区域探测
         let usage_result = if is_enterprise {
-            let (result, detected_region) = get_enterprise_usage_with_region_probe(&auth_result.access_token, &machine_id).await?;
-            region = detected_region;
+            let (result, detected_cw_region) = get_enterprise_usage_with_region_probe(&auth_result.access_token, &machine_id).await?;
+            region = detected_cw_region; // CW 服务 region，与 oidc_region 分开
             result
         } else {
             get_usage_by_provider(&params.provider_id, &auth_result.access_token).await?
@@ -1012,6 +1027,7 @@ async fn add_account_by_idc_internal(
             existing.client_id = Some(params.client_id.clone());
             existing.client_secret = Some(params.client_secret.clone());
             existing.region = Some(region.clone());
+            existing.oidc_region = oidc_region.clone();
             existing.client_id_hash = client_id_hash.clone(); // 可能是 None
             existing.start_url = start_url.clone();
             if id_token.is_some() {
@@ -1036,6 +1052,7 @@ async fn add_account_by_idc_internal(
             account.client_id = Some(params.client_id.clone());
             account.client_secret = Some(params.client_secret.clone());
             account.region = Some(region.clone());
+            account.oidc_region = oidc_region.clone();
             account.client_id_hash = client_id_hash; // 可能是 None
             account.start_url = start_url.clone();
             account.id_token = id_token;
@@ -1089,6 +1106,7 @@ async fn add_account_by_idc_internal(
             existing.client_id = Some(params.client_id.clone());
             existing.client_secret = Some(params.client_secret.clone());
             existing.region = Some(region.clone());
+            existing.oidc_region = oidc_region.clone();
             existing.client_id_hash = client_id_hash.clone(); // 可能是 None
             if id_token.is_some() {
                 existing.id_token = id_token;
@@ -1120,6 +1138,7 @@ async fn add_account_by_idc_internal(
             account.client_id = Some(params.client_id.clone());
             account.client_secret = Some(params.client_secret.clone());
             account.region = Some(region.clone());
+            account.oidc_region = oidc_region.clone();
             account.client_id_hash = client_id_hash; // 可能是 None
             account.id_token = id_token;
             account.sso_session_id = sso_session_id;

@@ -1708,6 +1708,60 @@ fn sanitize_history(mut items: Vec<HistoryItem>) -> Vec<HistoryItem> {
         }
     }).map(|(_, item)| item).collect();
 
+    // 步骤 2.5：移除孤儿 toolResults
+    // 如果 user 携带 toolResults 但前一条 assistant 没有匹配的 toolUseId，移除这些孤儿
+    // 命中 Kiro API 的 TOOL_RESULTS_AND_NO_USES / TOOL_RESULTS_ORPHAN_IDS 校验，
+    // 否则上游会返回 "Improperly formed request"
+    for idx in 0..items.len() {
+        let prev_tool_use_ids: std::collections::HashSet<String> = if idx > 0 {
+            match &items[idx - 1] {
+                HistoryItem::Assistant { assistant_response_message } => {
+                    assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(|uses| uses.iter().map(|u| u.tool_use_id.clone()).collect())
+                        .unwrap_or_default()
+                }
+                _ => std::collections::HashSet::new(),
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        if let HistoryItem::User { user_input_message } = &mut items[idx] {
+            if let Some(ctx) = user_input_message.user_input_message_context.as_mut() {
+                let mut should_clear = false;
+                if let Some(results) = ctx.tool_results.as_mut() {
+                    let original_len = results.len();
+                    results.retain(|r| prev_tool_use_ids.contains(&r.tool_use_id));
+                    let removed = original_len - results.len();
+                    if removed > 0 {
+                        log::warn!(
+                            "[网关] sanitize_history: 移除 {} 个孤儿 toolResults（无匹配的前置 assistant tool_use）",
+                            removed
+                        );
+                    }
+                    if results.is_empty() {
+                        should_clear = true;
+                    }
+                }
+                if should_clear {
+                    ctx.tool_results = None;
+                }
+            }
+            // 如果移除孤儿后 content 也为空，给个占位避免空消息
+            let has_results = user_input_message
+                .user_input_message_context
+                .as_ref()
+                .and_then(|c| c.tool_results.as_ref())
+                .map(|r| !r.is_empty())
+                .unwrap_or(false);
+            if user_input_message.content.trim().is_empty() && !has_results {
+                user_input_message.content = "Continue".to_string();
+            }
+        }
+    }
+
     // 步骤 3：补充缺失的 toolResults
     // 如果 assistant 有 toolUses 但下一条 user 没有对应 toolResults，插入错误占位
     let mut patched: Vec<HistoryItem> = Vec::new();

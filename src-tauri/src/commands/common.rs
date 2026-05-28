@@ -235,7 +235,8 @@ pub async fn refresh_token_by_provider(account: &Account) -> Result<RefreshResul
         let metadata = RefreshMetadata {
             client_id: account.client_id.clone(),
             client_secret: account.client_secret.clone(),
-            region: account.region.clone(),
+            // oidc_region 优先（IdC client 注册的 region），fallback 到 region
+            region: account.oidc_region.clone().or_else(|| account.region.clone()),
             ..Default::default()
         };
         let region = metadata.region.as_deref().unwrap_or("us-east-1");

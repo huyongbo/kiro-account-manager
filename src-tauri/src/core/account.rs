@@ -123,6 +123,9 @@ pub struct Account {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub region: Option<String>,
+    /// OIDC token 刷新专用 region（IdC client 注册的 region，可能与 CW 服务 region 不同）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_region: Option<String>,
     pub client_id_hash: Option<String>,
     pub sso_session_id: Option<String>,
     pub id_token: Option<String>,
@@ -182,6 +185,7 @@ impl Account {
             client_id: None,
             client_secret: None,
             region: None,
+            oidc_region: None,
             client_id_hash: None,
             sso_session_id: None,
             id_token: None,
@@ -219,6 +223,7 @@ impl Account {
             client_id: None,
             client_secret: None,
             region: None,
+            oidc_region: None,
             client_id_hash: None,
             sso_session_id: None,
             id_token: None,

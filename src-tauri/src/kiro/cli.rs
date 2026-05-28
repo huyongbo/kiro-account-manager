@@ -19,8 +19,23 @@ const CLI_OAUTH_FLOW: &str = "Pkce";
 /// CLI 2.0 Social 登录固定 start_url（如果源账号没有）
 const CLI_SOCIAL_START_URL: &str = "https://view.awsapps.com/start";
 
-/// CLI 2.0 默认 region
+/// CLI 2.0 默认 region（仅在所有来源都读不到时使用）
 const CLI_DEFAULT_REGION: &str = "us-east-1";
+
+/// 从 kiro-auth-token-cli.json 读取 region 字段
+fn read_region_from_cli_token_file() -> Option<String> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let path = std::path::Path::new(&home)
+        .join(".aws")
+        .join("sso")
+        .join("cache")
+        .join("kiro-auth-token-cli.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v["region"].as_str().map(str::to_string)
+}
 
 /// Kiro CLI 账号数据
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -117,6 +132,10 @@ pub fn read_kiro_cli_accounts(db_path: &str) -> Result<Vec<KiroCliAccount>, Stri
                 if let Ok(device_reg) = read_device_registration(&conn) {
                     account.client_id = Some(device_reg.client_id);
                     account.client_secret = Some(device_reg.client_secret);
+                    // token 里没有 region 时，用 device-registration 的 region 补充
+                    if account.region == CLI_DEFAULT_REGION && !device_reg.region.is_empty() {
+                        account.region = device_reg.region;
+                    }
                 }
             }
             accounts.push(account);
@@ -153,8 +172,9 @@ fn read_token_from_db(conn: &Connection, key: &str) -> SqliteResult<KiroCliAccou
 
     let region = token_data["region"]
         .as_str()
-        .unwrap_or("us-east-1")
-        .to_string();
+        .map(str::to_string)
+        .or_else(read_region_from_cli_token_file)
+        .unwrap_or_else(|| CLI_DEFAULT_REGION.to_string());
 
     let expires_at = token_data["expires_at"]
         .as_str()

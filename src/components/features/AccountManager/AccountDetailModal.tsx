@@ -582,7 +582,7 @@ function AccountDetailModal({ account, onClose, onRefresh }: AccountDetailModalP
                 <div className="bg-muted/30 border rounded-xl p-4 text-sm space-y-3">
                   <div className="flex justify-between items-center py-1 border-b border-border/50">
                     <span className="text-muted-foreground text-xs">Region</span>
-                    <span className="font-mono text-xs px-1.5 py-0.5 bg-muted rounded-md">us-east-1</span>
+                    <span className="font-mono text-xs px-1.5 py-0.5 bg-muted rounded-md">{currentAccount.region || 'us-east-1'}</span>
                   </div>
                   <div className="flex justify-between items-center py-1 border-b border-border/50">
                     <span className="text-muted-foreground text-xs">Token 到期</span>
