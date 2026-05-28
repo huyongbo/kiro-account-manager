@@ -2,7 +2,6 @@
 
 use crate::core::account::Account;
 use crate::commands::common::{extract_user_info, get_usage_by_provider};
-use crate::kiro::cli::read_kiro_cli_accounts;
 use crate::state::AppState;
 use serde::Serialize;
 use std::sync::{Mutex, MutexGuard};
@@ -20,25 +19,7 @@ fn expand_home_dir(path: &str) -> Result<String, String> {
     }
 }
 
-/// 从 CLI 账号判断 provider
-fn determine_provider(cli_account: &crate::kiro::cli::KiroCliAccount) -> String {
-    if cli_account.auth_method == "social" {
-        // Social Login，通过 profile_arn 判断
-        if let Some(ref arn) = cli_account.profile_arn {
-            if arn.contains("google") {
-                return "Google".to_string();
-            } else if arn.contains("github") {
-                return "Github".to_string();
-            }
-        }
-        "Unknown".to_string()
-    } else {
-        // OIDC，默认 BuilderId
-        "BuilderId".to_string()
-    }
-}
-
-/// 检查账号是否已存在
+/// 检查账号是否已存在（按 user_id 或 client_id_hash 去重）
 fn find_existing_account(
     accounts: &[Account],
     user_id: Option<&String>,
@@ -47,26 +28,9 @@ fn find_existing_account(
     if let Some(uid) = user_id {
         return accounts
             .iter()
-            .position(|a| a.user_id.as_ref() == Some(uid));
+            .position(|a| a.user_id.as_ref() == Some(uid) || a.client_id_hash.as_ref() == Some(uid));
     }
-
     None
-}
-
-/// 创建账号标签
-fn create_account_label(
-    is_new: bool,
-    token_key: &str,
-    existing_account: Option<&Account>,
-) -> String {
-    if is_new {
-        format!("从 kiro-cli 导入 ({token_key})")
-    } else {
-        existing_account.map_or_else(
-            || format!("从 kiro-cli 导入 ({token_key})"),
-            |a| a.label.clone(),
-        )
-    }
 }
 
 fn lock_account_store<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
@@ -134,104 +98,198 @@ pub fn get_kiro_cli_default_path() -> Result<String, String> {
     // 文件不存在，返回空字符串（前端会显示占位符）
     Ok(String::new())
 }
-/// 从 kiro-cli 数据库导入账号
+/// 从 kiro-auth-token-cli.json 读取 CLI token（类比 IDE 导入读 kiro-auth-token.json）
+fn read_kiro_cli_token_file() -> Result<serde_json::Value, String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "无法获取用户主目录".to_string())?;
+
+    let path = std::path::Path::new(&home)
+        .join(".aws")
+        .join("sso")
+        .join("cache")
+        .join("kiro-auth-token-cli.json");
+
+    if !path.exists() {
+        return Err(format!("未找到 kiro-cli token 文件: {}", path.display()));
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取 kiro-auth-token-cli.json 失败: {e}"))?;
+
+    serde_json::from_str(&content)
+        .map_err(|e| format!("解析 kiro-auth-token-cli.json 失败: {e}"))
+}
+
+/// 从 kiro-cli 导入账号（直接读 kiro-auth-token-cli.json，类比 IDE 导入）
 #[tauri::command]
 pub async fn import_from_kiro_cli(
-    db_path: String,
+    _db_path: String,
     state: State<'_, AppState>,
 ) -> Result<KiroCliImportResult, String> {
-    eprintln!("[Kiro CLI Import] 开始导入，数据库路径: {db_path}");
+    eprintln!("[Kiro CLI Import] 开始导入（读取 kiro-auth-token-cli.json）");
 
-    // 展开 ~ 为用户主目录
-    let expanded_path = expand_home_dir(&db_path)?;
-    eprintln!("[Kiro CLI Import] 展开后的路径: {expanded_path}");
+    // 1. 读取 kiro-auth-token-cli.json
+    let token_json = read_kiro_cli_token_file()?;
 
-    // 1. 读取 kiro-cli 数据库
-    let cli_accounts = read_kiro_cli_accounts(&expanded_path)?;
+    let access_token = token_json["accessToken"].as_str()
+        .ok_or("kiro-auth-token-cli.json 缺少 accessToken")?
+        .to_string();
+    let refresh_token = token_json["refreshToken"].as_str()
+        .ok_or("kiro-auth-token-cli.json 缺少 refreshToken")?
+        .to_string();
+    let expires_at = token_json["expiresAt"].as_str().map(str::to_string);
+    let auth_method = token_json["authMethod"].as_str().unwrap_or("IdC").to_string();
+    let region = token_json["region"].as_str().unwrap_or("us-east-1").to_string();
+    let client_id_hash = token_json["clientIdHash"].as_str().map(str::to_string);
+    let start_url = token_json["startUrl"].as_str().map(str::to_string);
+    let profile_arn = token_json["profileArn"].as_str().map(str::to_string);
 
-    if cli_accounts.is_empty() {
-        return Err("数据库中没有账号数据".to_string());
-    }
+    eprintln!("[Kiro CLI Import] auth_method={auth_method}, region={region}, client_id_hash={client_id_hash:?}");
 
-    if cli_accounts.len() > 1 {
-        return Err("数据库中有多个账号，请联系开发者".to_string());
-    }
-
-    let cli_account = &cli_accounts[0];
-    let auth_method = &cli_account.auth_method;
-    let token_key = &cli_account.token_key;
-    eprintln!("[Kiro CLI Import] 读取到账号: auth_method={auth_method}, token_key={token_key}");
-
-    // 2. 调用统一的 getUsageLimits API 获取配额
-    let provider = determine_provider(cli_account);
-    let usage_result = get_usage_by_provider(&provider, &cli_account.access_token).await;
-
-    let (email, user_id, usage_data, is_banned, is_auth_error) = match usage_result {
-        Ok(result) => {
-            let (email, user_id) = extract_user_info(&result.usage_data);
-            (email, user_id, Some(result.usage_data), result.is_banned, result.is_auth_error)
+    // 2. 判断 provider（类比 IDE 导入逻辑）
+    let provider = if auth_method == "IdC" {
+        // 有自定义 start_url 且不是 BuilderId 默认 URL → Enterprise
+        match start_url.as_deref() {
+            Some(url) if !url.to_lowercase().contains("view.awsapps.com") => "Enterprise",
+            _ => "BuilderId",
         }
-        Err(e) => {
-            eprintln!("[Kiro CLI Import] 获取配额失败: {e}");
-            return Ok(KiroCliImportResult {
-                success: false,
-                is_new: false,
-                account: None,
-                error: Some(format!("获取账号信息失败: {e}")),
-            });
+    } else {
+        // Social 账号，通过 profileArn 判断
+        match profile_arn.as_deref() {
+            Some(arn) if arn.to_lowercase().contains("github") => "Github",
+            _ => "Google",
         }
+    }.to_string();
+
+    eprintln!("[Kiro CLI Import] provider={provider}");
+
+    // 3. 读取 client registration（类比 IDE 导入读 {clientIdHash}.json）
+    let (client_id, client_secret) = if auth_method == "IdC" {
+        if let Some(ref hash) = client_id_hash {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default();
+            let client_path = std::path::Path::new(&home)
+                .join(".aws").join("sso").join("cache")
+                .join(format!("{hash}.json"));
+            if let Ok(content) = std::fs::read_to_string(&client_path) {
+                if let Ok(reg) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let cid = reg["clientId"].as_str().map(str::to_string);
+                    let csec = reg["clientSecret"].as_str().map(str::to_string);
+                    eprintln!("[Kiro CLI Import] 读取到 client registration: clientId={cid:?}");
+                    (cid, csec)
+                } else { (None, None) }
+            } else {
+                eprintln!("[Kiro CLI Import] 未找到 {hash}.json，跳过 client registration");
+                (None, None)
+            }
+        } else { (None, None) }
+    } else { (None, None) };
+
+    // 4. 用 clientIdHash 作为账号唯一标识（类比 IDE 导入用 email）
+    //    clientIdHash 是 SHA1({"startUrl":"..."})，对同一账号是固定的
+    let user_id = client_id_hash.clone()
+        .or_else(|| {
+            // 如果没有 clientIdHash，用 refreshToken 前 20 字符作为标识
+            Some(refresh_token.chars().take(20).collect())
+        });
+
+    eprintln!("[Kiro CLI Import] user_id={user_id:?}");
+
+    // 5. 检查账号是否已存在（先 drop store，await 之后再重新获取）
+    let existing_index = {
+        let store = lock_account_store(&state.store)?;
+        find_existing_account(&store.accounts, user_id.as_ref(), None)
     };
-
-    // 3. 检查账号是否已存在
-    let mut store = lock_account_store(&state.store)?;
-    let existing_index = find_existing_account(&store.accounts, user_id.as_ref(), email.as_ref());
     let is_new = existing_index.is_none();
 
-    // 4. 创建或更新 Account
-    let existing_account = existing_index.and_then(|idx| store.accounts.get(idx));
-    let label = create_account_label(is_new, &cli_account.token_key, existing_account);
-
-    let mut account = if let Some(e) = email.clone() {
-        Account::new(e, label)
-    } else if let Some(uid) = user_id.clone() {
-        Account::new_enterprise(uid, label)
+    // 6. 创建账号标签
+    let label = if is_new {
+        format!("从 kiro-cli 导入 ({})", start_url.as_deref().unwrap_or("BuilderId"))
     } else {
-        return Ok(KiroCliImportResult {
-            success: false,
-            is_new: false,
-            account: None,
-            error: Some("无法获取账号标识（email 或 userId）".to_string()),
-        });
+        let store = lock_account_store(&state.store)?;
+        existing_index
+            .and_then(|idx| store.accounts.get(idx))
+            .map(|a| a.label.clone())
+            .unwrap_or_else(|| "从 kiro-cli 导入".to_string())
     };
 
-    // 5. 填充字段
-    account.access_token = Some(cli_account.access_token.clone());
-    account.refresh_token = Some(cli_account.refresh_token.clone());
-    account.expires_at.clone_from(&cli_account.expires_at);
-    account.provider = Some(provider);
-    account.user_id = user_id;
-    account.region = Some(cli_account.region.clone());
-    account.usage_data = usage_data;
-
-    // 更新账号状态（包括封禁检测）
-    crate::commands::common::update_account_status(&mut account, is_banned, is_auth_error);
-
-    // 6. 根据认证类型填充字段
-    if cli_account.auth_method == "social" {
-        account.auth_method = Some("social".to_string());
-        account.profile_arn.clone_from(&cli_account.profile_arn);
+    // 7. 创建 Account（Enterprise 用 new_enterprise，其他用 new）
+    let mut account = if provider == "Enterprise" || provider == "BuilderId" {
+        Account::new_enterprise(
+            user_id.clone().unwrap_or_else(|| "unknown".to_string()),
+            label,
+        )
     } else {
-        account.auth_method = Some("IdC".to_string());
-        account.client_id.clone_from(&cli_account.client_id);
-        account.client_secret.clone_from(&cli_account.client_secret);
+        // Social 账号，email 后续通过 API 获取，先用占位符
+        Account::new(String::new(), label)
+    };
+
+    // 8. 填充字段
+    account.access_token = Some(access_token);
+    account.refresh_token = Some(refresh_token);
+    account.expires_at = expires_at;
+    account.provider = Some(provider.clone());
+    account.user_id = user_id;
+    // oidc_region：来自 JSON 文件的 region，用于 token 刷新（类比 IDE 导入的 oidc_region）
+    // region：CW 服务调用的 region，Enterprise 账号需要多区域探测，先用 oidc_region 占位
+    account.oidc_region = Some(region.clone());
+    account.region = Some(region.clone()); // 先用 oidc_region，Enterprise 账号后续探测会更新
+    account.auth_method = Some(auth_method.clone());
+    account.client_id_hash = client_id_hash;
+    account.start_url = start_url;
+    account.client_id = client_id;
+    account.client_secret = client_secret;
+    if auth_method != "IdC" {
+        account.profile_arn = profile_arn;
     }
 
-    // 7. 生成或保留 machine_id
+    // 9. 尝试调用 API 获取配额和真实用户信息（失败不阻断导入）
+    //    Enterprise 账号使用多区域探测，同时更新 CW 服务 region
+    let access_token_ref = account.access_token.clone().unwrap_or_default();
+    if provider == "Enterprise" {
+        use crate::commands::common::get_enterprise_usage_with_region_probe;
+        use crate::commands::machine_guid::get_machine_id;
+        let machine_id = account.machine_id.clone().unwrap_or_else(get_machine_id);
+        match get_enterprise_usage_with_region_probe(&access_token_ref, &machine_id).await {
+            Ok((result, detected_region)) => {
+                if !detected_region.is_empty() {
+                    eprintln!("[Kiro CLI Import] Enterprise 探测到 CW region: {detected_region}");
+                    account.region = Some(detected_region); // 更新为真实 CW 服务 region
+                }
+                let (api_email, api_user_id) = extract_user_info(&result.usage_data);
+                if let Some(e) = api_email { account.email = Some(e); }
+                if let Some(uid) = api_user_id { account.user_id = Some(uid); }
+                account.usage_data = Some(result.usage_data);
+                crate::commands::common::update_account_status(&mut account, result.is_banned, result.is_auth_error);
+            }
+            Err(e) => {
+                eprintln!("[Kiro CLI Import] Enterprise 获取配额失败（不影响导入）: {e}");
+                account.status = "invalid".to_string();
+            }
+        }
+    } else {
+        match get_usage_by_provider(&provider, &access_token_ref).await {
+            Ok(result) => {
+                let (api_email, api_user_id) = extract_user_info(&result.usage_data);
+                if let Some(e) = api_email { account.email = Some(e); }
+                if let Some(uid) = api_user_id { account.user_id = Some(uid); }
+                account.usage_data = Some(result.usage_data);
+                crate::commands::common::update_account_status(&mut account, result.is_banned, result.is_auth_error);
+            }
+            Err(e) => {
+                eprintln!("[Kiro CLI Import] 获取配额失败（不影响导入）: {e}");
+                account.status = "invalid".to_string();
+            }
+        }
+    }
+
+    // 10. 保存账号（await 之后重新获取 store）
+    let mut store = lock_account_store(&state.store)?;
     if let Some(idx) = existing_index {
-        // 更新现有账号，保留 machine_id
-        account
-            .machine_id
-            .clone_from(&store.accounts[idx].machine_id);
+        // 更新现有账号，保留 machine_id 和 id
+        account.machine_id.clone_from(&store.accounts[idx].machine_id);
         account.id.clone_from(&store.accounts[idx].id);
         store.accounts[idx] = account.clone();
     } else {
@@ -245,9 +303,9 @@ pub async fn import_from_kiro_cli(
     store.save_to_file();
     drop(store);
 
-    let email = &account.email;
-    let user_id = &account.user_id;
-    eprintln!("[Kiro CLI Import] 导入成功: is_new={is_new}, email={email:?}, user_id={user_id:?}");
+    let display_email = &account.email;
+    let display_user_id = &account.user_id;
+    eprintln!("[Kiro CLI Import] 导入成功: is_new={is_new}, email={display_email:?}, user_id={display_user_id:?}");
 
     Ok(KiroCliImportResult {
         success: true,
